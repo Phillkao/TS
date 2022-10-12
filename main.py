@@ -1,65 +1,38 @@
-import argparse
-import torch
-import numpy as np
-import pandas as pd
-from PIL import Image
-import cv2
-import torch.nn as nn
-import torch.optim as optim
+from torch import optim
 from torch.optim import lr_scheduler
-from torchvision import datasets, models, transforms
-from torch.utils.data.dataset import Dataset
-from torch.utils.data import DataLoader
 
-from utils import train_model
-from aoi_dataset import aoi_Dataset
-#import senet
+from data_preprocessing import *
+from data import *
+from model import *
+from grad_cam import *
+from utils import *
 
-parser = argparse.ArgumentParser(description='PyTorch Implementation of AOI Classifier.')
+import argparse as args
 
-parser.add_argument('--train_zip', type=str, default='dataset/train_images.zip', help='Training data with zip file path.')
-parser.add_argument('--train_csv', type=str, default='dataset/train.csv', help='Training data with csv file path.')
-parser.add_argument('--batch_size', type=int, default=16, help='Training batch size')
-parser.add_argument('--epoch', type=int, default=30, help='Training epoch')
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+PATH = 'Data/KN03_hourly_preprocessed_new_pipeline_20220719.csv'
+ROLLING = True
+MODE = 'PWR_std'
 
-args = parser.parse_args()
+X_raw, Y_raw, X_time_step, Y_time_step, X_rolling, Y_rolling, FEATURES_NAME = data_gen(path=PATH,
+                                                                                       time_step=120,
+                                                                                       target_time_length=24,
+                                                                                       target_diff=False,
+                                                                                       add_lags=True, add_current=True)
+if ROLLING:
+    Y = Y_rolling
+    X = X_rolling.reshape((len(X_rolling), 1, X_rolling.shape[1], X_rolling.shape[2]))
+else:
+    Y = Y_time_step
+    X = X_time_step.reshape((len(X_time_step), 1, X_time_step.shape[1], X_time_step.shape[2]))
 
-transform = transforms.Compose([transforms.Resize(256), 
-                                transforms.RandomCrop(224),
-                                transforms.RandomVerticalFlip(),
-                                transforms.RandomHorizontalFlip(),
-                                transforms.ColorJitter(),
-                                transforms.ToTensor()])
+Y, cls_name = kmeans_label(Y, mode=MODE)
 
-                            
-train_set = aoi_Dataset(args.train_zip, args.train_csv, transform)
-[print('class {0}: {1:.1f}%'.format(i, train_set.get_class_ratio()[i]*100)) for i in range(train_set.num_class)]
-train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, pin_memory=True)
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-# download pretrained model
-model = models.densenet201(pretrained=True)
-#model = models.resnet152(pretrained=True)
-#model = senet.senet154(num_classes=6)
-
-# modify the input channel and number of class
-# ResNet152
-#model.conv1 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
-#model.fc = nn.Sequential(nn.Linear(in_features=2048, out_features=6, bias=True))
-# DenseNet201
-model.features.conv0 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
-model.classifier = nn.Sequential(nn.Linear(in_features=1920, out_features=6, bias=True))
-
-#model = models.DenseNet(growth_rate=32, block_config=(6, 12, 64, 48), num_init_features=64, num_classes=6)
-#model.features.conv0 = nn.Conv2d(1, 64, kernel_size=(7, 7), stride=(2, 2), padding=(3, 3), bias=False)
-#model.classifier = nn.Sequential(nn.Linear(in_features=1920, out_features=6, bias=True))
-
-model = model.to(device)
-
+train_loader, test_loader, sample_weight = create_dataloader(X, Y, 'PWR_std_cat3', batch_size=50)
+xcm = XCM(input_shape=(X.shape[1], X.shape[2]), n_class=3, filters_num=128).to(DEVICE)
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.SGD(model.parameters(), momentum=0.9, lr=0.001)
-exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
-model = train_model(model, criterion, optimizer, train_loader,
-                    exp_lr_scheduler, num_epochs=args.epoch, device=device)
-
-train_set.close_zip()
+optimizer = optim.Adam(xcm.parameters(), lr=0.001)
+exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1)
+xcm, cls_1_xcm, history_1_xcm = train_model(xcm, criterion, optimizer, train_loader, test_loader, exp_lr_scheduler,
+                                            cls_name, num_epochs=100, device=DEVICE, mode='STD_3class_120_rm_xcm',
+                                            verbose=True)
